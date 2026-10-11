@@ -21,13 +21,19 @@ public sealed class AntiSpamService
         var guild = channel.Guild;
         var now = DateTimeOffset.UtcNow;
 
-        if (message.Author is SocketWebhookUser webhookUser)
+        if (message.Source == MessageSource.Webhook || message.Author is SocketWebhookUser)
         {
-            var webhookState = GetState(guild.Id, webhookUser.Id);
+            if (message.Author is not SocketWebhookUser webhookUser)
+            {
+                return;
+            }
+
+            var webhookId = webhookUser.WebhookId;
+            var webhookState = GetState(guild.Id, webhookId);
 
             if (RegisterFlood(webhookState, now, false, out _))
             {
-                await RemoveWebhookAsync(message, guild, webhookUser.Id);
+                await RemoveWebhookAsync(message, guild, webhookId);
             }
 
             return;
@@ -38,7 +44,7 @@ public sealed class AntiSpamService
             return;
         }
 
-        if (!user.IsBot && user.GuildPermissions.Administrator)
+        if (!user.IsBot && IsStaff(user))
         {
             return;
         }
@@ -58,7 +64,7 @@ public sealed class AntiSpamService
 
         if (state.BanAfterRejoin)
         {
-            await BanForRepeatedFloodAsync(message, user, guild, state);
+            await BanForRepeatedFloodAsync(message, user, guild, state, warningCount - 1);
             return;
         }
 
@@ -67,12 +73,22 @@ public sealed class AntiSpamService
             if (!guild.CurrentUser.GuildPermissions.KickMembers)
             {
                 Console.WriteLine($"Não foi possível expulsar {user.Username}: falta a permissão Expulsar membros.");
+                FinishPunishment(state, false, warningCount, false);
                 return;
             }
 
-            await message.Channel.SendMessageAsync($"{user.Mention} foi expulso por continuar floodando o chat.");
-            await user.KickAsync("Flood detectado repetidamente.");
-            state.BanAfterRejoin = true;
+            try
+            {
+                await user.KickAsync("Flood detectado repetidamente.");
+                FinishPunishment(state, true, warningCount, true);
+                await SendNoticeAsync(message, $"{user.Mention} foi expulso por continuar floodando o chat.");
+            }
+            catch (HttpException ex)
+            {
+                FinishPunishment(state, false, warningCount, false);
+                Console.WriteLine($"Não foi possível expulsar {user.Username}: {ex.Message}");
+            }
+
             return;
         }
 
@@ -81,6 +97,7 @@ public sealed class AntiSpamService
         if (!guild.CurrentUser.GuildPermissions.ModerateMembers)
         {
             Console.WriteLine($"Não foi possível aplicar timeout em {user.Username}: falta a permissão Moderar membros.");
+            FinishPunishment(state, false, warningCount, false);
             return;
         }
 
@@ -91,10 +108,12 @@ public sealed class AntiSpamService
                 properties.TimedOutUntil = now + duration;
             });
 
-            await message.Channel.SendMessageAsync($"{user.Mention} não é para floodar o chat. Timeout aplicado por {FormatDuration(duration)}.");
+            FinishPunishment(state, true, warningCount, false);
+            await SendNoticeAsync(message, $"{user.Mention} não é para floodar o chat. Timeout aplicado por {FormatDuration(duration)}.");
         }
         catch (HttpException ex)
         {
+            FinishPunishment(state, false, warningCount, false);
             Console.WriteLine($"Não foi possível aplicar timeout em {user.Username}: {ex.Message}");
         }
     }
@@ -119,7 +138,7 @@ public sealed class AntiSpamService
             }
 
             await webhook.DeleteAsync();
-            await message.Channel.SendMessageAsync($"O webhook {webhook.Name} foi removido por flood.");
+            await SendNoticeAsync(message, $"O webhook {webhook.Name} foi removido por flood.");
         }
         catch (HttpException ex)
         {
@@ -145,23 +164,50 @@ public sealed class AntiSpamService
         }
     }
 
-    private static async Task BanForRepeatedFloodAsync(SocketMessage message, SocketGuildUser user, SocketGuild guild, UserSpamState state)
+    private static async Task BanForRepeatedFloodAsync(SocketMessage message, SocketGuildUser user, SocketGuild guild, UserSpamState state, int warningCount)
     {
         if (!guild.CurrentUser.GuildPermissions.BanMembers)
         {
             Console.WriteLine($"{user.Username} voltou após um kick e continuou floodando, mas falta a permissão Banir membros.");
+            FinishPunishment(state, false, warningCount, false);
             return;
         }
 
         try
         {
-            await message.Channel.SendMessageAsync($"{user.Mention} foi banido por voltar e continuar floodando o chat.");
             await guild.AddBanAsync(user, reason: "Voltou após kick e continuou floodando.");
-            state.BanAfterRejoin = false;
+            FinishPunishment(state, true, warningCount, false);
+            await SendNoticeAsync(message, $"{user.Mention} foi banido por voltar e continuar floodando o chat.");
         }
         catch (HttpException ex)
         {
+            FinishPunishment(state, false, warningCount, false);
             Console.WriteLine($"Não foi possível banir {user.Username}: {ex.Message}");
+        }
+    }
+
+    private static bool IsStaff(SocketGuildUser user)
+    {
+        var permissions = user.GuildPermissions;
+
+        return permissions.Administrator
+            || permissions.ManageGuild
+            || permissions.ManageMessages
+            || permissions.ManageRoles
+            || permissions.ModerateMembers
+            || permissions.KickMembers
+            || permissions.BanMembers;
+    }
+
+    private static async Task SendNoticeAsync(SocketMessage message, string text)
+    {
+        try
+        {
+            await message.Channel.SendMessageAsync(text);
+        }
+        catch (HttpException ex)
+        {
+            Console.WriteLine($"Não foi possível enviar o aviso de moderação: {ex.Message}");
         }
     }
 
@@ -179,6 +225,7 @@ public sealed class AntiSpamService
             state.Messages.Clear();
             state.WarningCount = 0;
             state.BanAfterRejoin = false;
+            state.PunishmentPending = false;
         }
     }
 
@@ -190,6 +237,8 @@ public sealed class AntiSpamService
         {
             state.Messages.Clear();
             state.WarningCount = count;
+            state.BanAfterRejoin = false;
+            state.PunishmentPending = false;
         }
     }
 
@@ -206,6 +255,8 @@ public sealed class AntiSpamService
 
             state.Messages.Clear();
             state.WarningCount--;
+            state.BanAfterRejoin = false;
+            state.PunishmentPending = false;
             return state.WarningCount;
         }
     }
@@ -228,13 +279,37 @@ public sealed class AntiSpamService
             }
 
             state.Messages.Clear();
-            if (countWarning)
+            if (state.PunishmentPending)
             {
-                state.WarningCount++;
+                warningCount = state.WarningCount;
+                return false;
             }
 
-            warningCount = state.WarningCount;
+            if (countWarning)
+            {
+                state.PunishmentPending = true;
+                warningCount = state.WarningCount + 1;
+            }
+            else
+            {
+                warningCount = state.WarningCount;
+            }
+
             return true;
+        }
+    }
+
+    private static void FinishPunishment(UserSpamState state, bool succeeded, int warningCount, bool wasKicked)
+    {
+        lock (state)
+        {
+            if (succeeded)
+            {
+                state.WarningCount = warningCount;
+                state.BanAfterRejoin = wasKicked;
+            }
+
+            state.PunishmentPending = false;
         }
     }
 
@@ -275,5 +350,6 @@ public sealed class AntiSpamService
         public Queue<DateTimeOffset> Messages { get; } = new();
         public int WarningCount { get; set; }
         public bool BanAfterRejoin { get; set; }
+        public bool PunishmentPending { get; set; }
     }
 }
